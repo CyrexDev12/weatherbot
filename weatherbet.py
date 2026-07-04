@@ -1098,64 +1098,99 @@ def run_loop():
     print(f"  Sources:    ECMWF + HRRR(US) + METAR(D+0)")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
-    
+
     discord_log(
-    discord_status_message(),
-    title="WeatherBot on",
-    color=5763719
-)
+        discord_status_message(),
+        title="WeatherBot on",
+        color=5763719
+    )
 
     last_full_scan = 0
 
     while True:
-        now_ts  = time.time()
+        now_ts = time.time()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Full scan once per hour
         if now_ts - last_full_scan >= SCAN_INTERVAL:
             print(f"[{now_str}] full scan...")
+
             try:
                 new_pos, closed, resolved = scan_and_update()
                 state = load_state()
-                print(f"  balance: ${state['balance']:,.2f} | "
-                      f"new: {new_pos} | closed: {closed} | resolved: {resolved}")
+
+                print(
+                    f"  balance: ${state['balance']:,.2f} | "
+                    f"new: {new_pos} | closed: {closed} | resolved: {resolved}"
+                )
+
+                discord_log(
+                    (
+                        f"**Full scan complete**\n"
+                        f"**Balance:** ${state['balance']:,.2f}\n"
+                        f"**New Positions:** {new_pos}\n"
+                        f"**Closed:** {closed}\n"
+                        f"**Resolved:** {resolved}\n\n"
+                        f"{discord_status_message()}"
+                    ),
+                    title="Hourly Scan Complete",
+                    color=3447003
+                )
+
                 last_full_scan = time.time()
+
             except KeyboardInterrupt:
                 print(f"\n  Stopping — saving state...")
                 save_state(load_state())
                 print(f"  Done. Bye!")
                 break
+
             except requests.exceptions.ConnectionError:
                 print(f"  Connection lost — waiting 60 sec")
+
                 discord_log(
-                "Connection lost. Waiting 60 seconds before retrying.",
-                title="WeatherBot Connection Error",
-                 color=15548997
-                    )
+                    "Connection lost. Waiting 60 seconds before retrying.",
+                    title="WeatherBot Connection Error",
+                    color=15548997
+                )
+
                 time.sleep(60)
                 continue
+
             except Exception as e:
                 print(f"  Error: {e} — waiting 60 sec")
-            discord_log(
-        f"Error: `{e}`\nWaiting 60 seconds before retrying.",
-        title="WeatherBot Error",
-        color=15548997
-        )
-            time.sleep(60)
-            continue
+
+                discord_log(
+                    f"Error: `{e}`\nWaiting 60 seconds before retrying.",
+                    title="WeatherBot Error",
+                    color=15548997
+                )
+
+                time.sleep(60)
+                continue
+
         else:
             # Quick stop monitoring
             print(f"[{now_str}] monitoring positions...")
+
             try:
                 stopped = monitor_positions()
                 if stopped:
                     state = load_state()
                     print(f"  balance: ${state['balance']:,.2f}")
+
             except Exception as e:
                 print(f"  Monitor error: {e}")
 
+                discord_log(
+                    f"Monitor error: `{e}`",
+                    title="WeatherBot Monitor Error",
+                    color=15548997
+                )
+
         try:
             time.sleep(MONITOR_INTERVAL)
+
         except KeyboardInterrupt:
             print(f"\n  Stopping — saving state...")
             save_state(load_state())

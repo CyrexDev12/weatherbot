@@ -10,5 +10,6 @@
   "scan_interval": 3600,
   "calibration_min": 30,
   "vc_key": "RYVXHUCTVYCVZNQJX8LW3CDCJ",
-  "max_slippage": 0.03
+  "max_slippage": 0.03,
+  "discord_webhook_url": "WEBHOOK URL"
 }

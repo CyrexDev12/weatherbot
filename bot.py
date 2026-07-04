@@ -13,6 +13,7 @@ Usage:
 """
 
 import re
+import os
 import sys
 import json
 import math
@@ -40,6 +41,10 @@ MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
 VC_KEY           = _cfg.get("vc_key", "")
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    _cfg.get("discord_webhook_url", "")
+)
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -89,6 +94,67 @@ TIMEZONES = {
 
 MONTHS = ["january","february","march","april","may","june",
           "july","august","september","october","november","december"]
+# =============================================================================
+# DISCORD LOGGING
+# =============================================================================
+
+def discord_log(message, title="WeatherBot", color=3447003):
+    """
+    Sends a message to Discord using a webhook.
+    Does nothing if DISCORD_WEBHOOK_URL is not configured.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    payload = {
+        "username": "WeatherBot",
+        "embeds": [
+            {
+                "title": title,
+                "description": message[:4000],
+                "color": color,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        ]
+    }
+
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=(3, 5))
+    except Exception as e:
+        print(f"  [DISCORD] Failed to send webhook: {e}")
+
+
+def discord_status_message():
+    """Builds a short status message for Discord."""
+    state = load_state()
+    markets = load_all_markets()
+
+    open_pos = [
+        m for m in markets
+        if m.get("position") and m["position"].get("status") == "open"
+    ]
+
+    resolved = [
+        m for m in markets
+        if m.get("status") == "resolved" and m.get("pnl") is not None
+    ]
+
+    bal = state.get("balance", BALANCE)
+    start = state.get("starting_balance", BALANCE)
+    ret_pct = ((bal - start) / start * 100) if start else 0.0
+
+    wins = state.get("wins", 0)
+    losses = state.get("losses", 0)
+    total = wins + losses
+    wr = f"{wins / total:.0%}" if total else "N/A"
+
+    return (
+        f"**Balance:** ${bal:,.2f}\n"
+        f"**Return:** {'+' if ret_pct >= 0 else ''}{ret_pct:.1f}%\n"
+        f"**Trades:** {total} | W: {wins} | L: {losses} | WR: {wr}\n"
+        f"**Open Positions:** {len(open_pos)}\n"
+        f"**Resolved Markets:** {len(resolved)}"
+    )
 
 # =============================================================================
 # MATH
@@ -570,6 +636,18 @@ def scan_and_update():
                         closed += 1
                         reason = "STOP" if current_price < entry else "TRAILING BE"
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                        discord_log(
+    (
+        f"**City:** {loc['name']}\n"
+        f"**Date:** {date}\n"
+        f"**Reason:** {reason}\n"
+        f"**Entry:** ${entry:.3f}\n"
+        f"**Exit:** ${current_price:.3f}\n"
+        f"**PnL:** {'+' if pnl >= 0 else ''}${pnl:.2f}"
+    ),
+    title="Position Closed",
+    color=15548997 if pnl < 0 else 5763719
+)
 
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
             if mkt.get("position") and forecast_temp is not None:
@@ -597,6 +675,19 @@ def scan_and_update():
                         mkt["position"]["status"]       = "closed"
                         closed += 1
                         print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                        discord_log(
+    (
+        f"**City:** {loc['name']}\n"
+        f"**Date:** {date}\n"
+        f"**Reason:** Forecast changed\n"
+        f"**Old Bucket:** {old_bucket_low}-{old_bucket_high}{unit_sym}\n"
+        f"**New Forecast:** {forecast_temp}{unit_sym}\n"
+        f"**Exit Price:** ${current_price:.3f}\n"
+        f"**PnL:** {'+' if pnl >= 0 else ''}${pnl:.2f}"
+    ),
+    title="Position Closed — Forecast Changed",
+    color=16776960
+)
 
             # --- OPEN POSITION ---
             if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
@@ -683,6 +774,22 @@ def scan_and_update():
                         print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
                               f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
                               f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
+                        discord_log(
+    (
+        f"**City:** {loc['name']}\n"
+        f"**Date:** {date} ({horizon})\n"
+        f"**Bucket:** {bucket_label}\n"
+        f"**Entry:** ${best_signal['entry_price']:.3f}\n"
+        f"**Cost:** ${best_signal['cost']:.2f}\n"
+        f"**Shares:** {best_signal['shares']}\n"
+        f"**Forecast:** {best_signal['forecast_temp']}{unit_sym} "
+        f"({best_signal['forecast_src'].upper()})\n"
+        f"**EV:** {best_signal['ev']:+.2f}\n"
+        f"**Kelly:** {best_signal['kelly']:.4f}"
+    ),
+    title="BUY Signal Opened",
+    color=5763719
+)
 
             # Market closed by time
             if hours < 0.5 and mkt["status"] == "open":
@@ -734,6 +841,20 @@ def scan_and_update():
 
         result = "WIN" if won else "LOSS"
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+        discord_log(
+    (
+        f"**City:** {mkt['city_name']}\n"
+        f"**Date:** {mkt['date']}\n"
+        f"**Result:** {result}\n"
+        f"**Entry:** ${price:.3f}\n"
+        f"**Cost:** ${size:.2f}\n"
+        f"**Shares:** {shares}\n"
+        f"**PnL:** {'+' if pnl >= 0 else ''}${pnl:.2f}"
+    ),
+    title=f"Market Resolved — {result}",
+    color=5763719 if won else 15548997
+)
+        
         resolved += 1
 
         save_market(mkt)
@@ -940,6 +1061,21 @@ def monitor_positions():
             pos["status"]       = "closed"
             closed += 1
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+
+            discord_log(
+    (
+        f"**City:** {city_name}\n"
+        f"**Date:** {mkt['date']}\n"
+        f"**Reason:** {reason}\n"
+        f"**Entry:** ${entry:.3f}\n"
+        f"**Exit:** ${current_price:.3f}\n"
+        f"**Hours Left:** {hours_left:.0f}\n"
+        f"**PnL:** {'+' if pnl >= 0 else ''}${pnl:.2f}"
+    ),
+    title="Position Closed — Monitor",
+    color=15548997 if pnl < 0 else 5763719
+)
+            
             save_market(mkt)
 
     if closed:
@@ -962,6 +1098,12 @@ def run_loop():
     print(f"  Sources:    ECMWF + HRRR(US) + METAR(D+0)")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
+    
+    discord_log(
+    discord_status_message(),
+    title="WeatherBot on",
+    color=5763719
+)
 
     last_full_scan = 0
 
@@ -985,12 +1127,22 @@ def run_loop():
                 break
             except requests.exceptions.ConnectionError:
                 print(f"  Connection lost — waiting 60 sec")
+                discord_log(
+                "Connection lost. Waiting 60 seconds before retrying.",
+                title="WeatherBot Connection Error",
+                 color=15548997
+                    )
                 time.sleep(60)
                 continue
             except Exception as e:
                 print(f"  Error: {e} — waiting 60 sec")
-                time.sleep(60)
-                continue
+            discord_log(
+        f"Error: `{e}`\nWaiting 60 seconds before retrying.",
+        title="WeatherBot Error",
+        color=15548997
+        )
+            time.sleep(60)
+            continue
         else:
             # Quick stop monitoring
             print(f"[{now_str}] monitoring positions...")

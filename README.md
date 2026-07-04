@@ -82,7 +82,7 @@ Create `config.json` in the project folder:
   "max_slippage": 0.03,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_KEY"
+  "vc_key": "RYVXHUCTVYCVZNQJX8LW3CDCJ"
 }
 ```
 

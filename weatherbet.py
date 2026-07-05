@@ -38,6 +38,7 @@ MIN_HOURS        = _cfg.get("min_hours", 2.0)
 MAX_HOURS        = _cfg.get("max_hours", 72.0)
 KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
+TAKER_FEE_RATE   = _cfg.get("taker_fee_rate", 0.05) # conservative weather rate
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
 VC_KEY           = _cfg.get("vc_key", "")
@@ -45,6 +46,7 @@ DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     _cfg.get("discord_webhook_url", "")
 )
+CLOB_HOST         = "https://clob.polymarket.com"
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -143,15 +145,19 @@ def discord_status_message():
     start = state.get("starting_balance", BALANCE)
     ret_pct = ((bal - start) / start * 100) if start else 0.0
 
-    wins = state.get("wins", 0)
-    losses = state.get("losses", 0)
-    total = wins + losses
-    wr = f"{wins / total:.0%}" if total else "N/A"
+    stats = trade_stats(markets)
+    wins = stats["wins"]
+    losses = stats["losses"]
+    total = stats["completed"]
+    decided = wins + losses
+    wr = f"{wins / decided:.0%}" if decided else "N/A"
 
     return (
         f"**Balance:** ${bal:,.2f}\n"
         f"**Return:** {'+' if ret_pct >= 0 else ''}{ret_pct:.1f}%\n"
-        f"**Trades:** {total} | W: {wins} | L: {losses} | WR: {wr}\n"
+        f"**Completed:** {total} | W: {wins} | L: {losses} | "
+        f"BE: {stats['breakeven']} | WR: {wr}\n"
+        f"**Estimated Fees Paid:** ${stats['fees']:.2f}\n"
         f"**Open Positions:** {len(open_pos)}\n"
         f"**Resolved Markets:** {len(resolved)}"
     )
@@ -164,21 +170,53 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """For regular buckets — exact match. For edge buckets — normal distribution."""
-    s = sigma or 2.0
-    if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
-    if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    return 1.0 if in_bucket(forecast, t_low, t_high) else 0.0
+    """Probability mass for an integer-resolved bucket under forecast uncertainty."""
+    mean = float(forecast)
+    s = max(float(sigma if sigma is not None else 2.0), 0.1)
 
-def calc_ev(p, price):
+    # Temperature markets resolve to whole-degree values. Half-degree continuity
+    # boundaries make exact and ranged buckets collectively cover the full curve.
+    if t_low == -999:
+        return norm_cdf((float(t_high) + 0.5 - mean) / s)
+    if t_high == 999:
+        return 1.0 - norm_cdf((float(t_low) - 0.5 - mean) / s)
+
+    lower = float(t_low) - 0.5
+    upper = float(t_high) + 0.5
+    return max(0.0, min(1.0, norm_cdf((upper - mean) / s) - norm_cdf((lower - mean) / s)))
+
+def estimate_taker_fee(shares, price, fee_rate=TAKER_FEE_RATE):
+    """Estimate Polymarket's dynamic taker fee in USDC."""
+    if shares <= 0 or price <= 0 or price >= 1 or fee_rate <= 0:
+        return 0.0
+    return round(float(shares) * float(fee_rate) * float(price) * (1.0 - float(price)), 5)
+
+def calc_ev(p, price, fee_rate=TAKER_FEE_RATE):
+    """Conservative expected ROI after estimated entry and early-exit fees."""
     if price <= 0 or price >= 1: return 0.0
-    return round(p * (1.0 / price - 1.0) - (1.0 - p), 4)
+    fee_per_share = estimate_taker_fee(1.0, price, fee_rate)
+    capital = price + fee_per_share
+    expected_profit = p - price - (2.0 * fee_per_share)
+    return round(expected_profit / capital, 4)
+
+def exit_financials(position, exit_price, charge_fee=True):
+    """Return net proceeds, exit fee, and all-in PnL for a closed position."""
+    shares = float(position["shares"])
+    gross_proceeds = shares * float(exit_price)
+    fee_rate = float(position.get("fee_rate", TAKER_FEE_RATE))
+    exit_fee = estimate_taker_fee(shares, exit_price, fee_rate) if charge_fee else 0.0
+    entry_fee = float(position.get("entry_fee", 0.0))
+    pnl = gross_proceeds - exit_fee - float(position["cost"]) - entry_fee
+    return round(gross_proceeds - exit_fee, 2), exit_fee, round(pnl, 2)
 
 def calc_kelly(p, price):
     if price <= 0 or price >= 1: return 0.0
-    b = 1.0 / price - 1.0
+    fee_per_share = estimate_taker_fee(1.0, price)
+    capital = price + fee_per_share
+    net_win = 1.0 - price - (2.0 * fee_per_share)
+    if capital <= 0 or net_win <= 0:
+        return 0.0
+    b = net_win / capital
     f = (p * b - (1.0 - p)) / b
     return round(min(max(0.0, f) * KELLY_FRACTION, 1.0), 4)
 
@@ -191,42 +229,82 @@ def bet_size(kelly, balance):
 # =============================================================================
 
 _cal: dict = {}
+HOUR_BUCKETS = (
+    (0, 12, "h00_12"),
+    (12, 24, "h12_24"),
+    (24, 48, "h24_48"),
+    (48, float("inf"), "h48_plus"),
+)
 
 def load_cal():
     if CALIBRATION_FILE.exists():
         return json.loads(CALIBRATION_FILE.read_text(encoding="utf-8"))
     return {}
 
-def get_sigma(city_slug, source="ecmwf"):
-    key = f"{city_slug}_{source}"
-    if key in _cal:
-        return _cal[key]["sigma"]
+def hours_bucket(hours):
+    try:
+        value = max(0.0, float(hours))
+    except (TypeError, ValueError):
+        return "h48_plus"
+    return next(label for low, high, label in HOUR_BUCKETS if low <= value < high)
+
+def get_sigma(city_slug, source="ecmwf", hours=None):
+    bucket_key = f"{city_slug}_{source}_{hours_bucket(hours)}"
+    if hours is not None and bucket_key in _cal:
+        return float(_cal[bucket_key]["sigma"])
+
+    # Preserve compatibility with calibration.json files from older versions.
+    legacy_key = f"{city_slug}_{source}"
+    if legacy_key in _cal:
+        return float(_cal[legacy_key]["sigma"])
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    """Recalculate forecast-error sigma by city, source, and lead time."""
+    resolved = [
+        m for m in markets
+        if m.get("status") == "resolved" and m.get("actual_temp") is not None
+    ]
     cal = load_cal()
     updated = []
 
     for source in ["ecmwf", "hrrr", "metar"]:
         for city in set(m["city"] for m in resolved):
             group = [m for m in resolved if m["city"] == city]
-            errors = []
-            for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
-                if snap and snap.get("temp") is not None:
-                    errors.append(abs(snap["temp"] - m["actual_temp"]))
-            if len(errors) < CALIBRATION_MIN:
-                continue
-            mae  = sum(errors) / len(errors)
-            key  = f"{city}_{source}"
-            old  = cal.get(key, {}).get("sigma", SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C)
-            new  = round(mae, 3)
-            cal[key] = {"sigma": new, "n": len(errors), "updated_at": datetime.now(timezone.utc).isoformat()}
-            if abs(new - old) > 0.05:
-                updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
+            for _, _, bucket in HOUR_BUCKETS:
+                errors = []
+                for market in group:
+                    candidates = [
+                        snap for snap in market.get("forecast_snapshots", [])
+                        if snap.get(source) is not None
+                        and snap.get("hours_left") is not None
+                        and hours_bucket(snap.get("hours_left")) == bucket
+                    ]
+                    if not candidates:
+                        continue
+                    # One observation per market/bin avoids overweighting days
+                    # that happened to receive more scans.
+                    snap = min(candidates, key=lambda item: float(item.get("hours_left", 999)))
+                    errors.append(float(snap[source]) - float(market["actual_temp"]))
+
+                if len(errors) < CALIBRATION_MIN:
+                    continue
+                rmse = math.sqrt(sum(error * error for error in errors) / len(errors))
+                default = SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C
+                key = f"{city}_{source}_{bucket}"
+                old = float(cal.get(key, {}).get("sigma", default))
+                new = round(max(rmse, 0.1), 3)
+                cal[key] = {
+                    "sigma": new,
+                    "bias": round(sum(errors) / len(errors), 3),
+                    "n": len(errors),
+                    "hours_bucket": bucket,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if abs(new - old) > 0.05:
+                    updated.append(
+                        f"{LOCATIONS[city]['name']} {source}/{bucket}: {old:.2f}->{new:.2f}"
+                    )
 
     CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
     if updated:
@@ -343,8 +421,14 @@ def check_market_resolved(market_id):
         if not closed:
             return None
         # Check YES price — if ~1.0 then WIN, if ~0.0 then LOSS
-        prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
-        yes_price = float(prices[0])
+        prices = parse_json_list(data.get("outcomePrices"))
+        outcomes = parse_json_list(data.get("outcomes"))
+        yes_index = next(
+            (i for i, outcome in enumerate(outcomes) if str(outcome).lower() == "yes"), 0
+        )
+        if yes_index >= len(prices):
+            return None
+        yes_price = float(prices[yes_index])
         if yes_price >= 0.95:
             return True   # WIN
         elif yes_price <= 0.05:
@@ -369,13 +453,117 @@ def get_polymarket_event(city_slug, month, day, year):
         pass
     return None
 
-def get_market_price(market_id):
+def parse_json_list(value):
+    """Gamma returns some list fields as JSON strings and others as lists."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return []
+
+def yes_token_id(market):
+    """Return the CLOB asset ID for the market's YES outcome."""
+    outcomes = parse_json_list(market.get("outcomes"))
+    token_ids = parse_json_list(market.get("clobTokenIds"))
+    for index, outcome in enumerate(outcomes):
+        if str(outcome).strip().lower() == "yes" and index < len(token_ids):
+            return str(token_ids[index])
+    return str(token_ids[0]) if token_ids else None
+
+def get_order_books(token_ids):
+    """Fetch public CLOB books in one request and index them by asset ID."""
+    unique_ids = list(dict.fromkeys(str(token_id) for token_id in token_ids if token_id))
+    if not unique_ids:
+        return {}
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
-        return float(prices[0])
-    except Exception:
+        response = requests.post(
+            f"{CLOB_HOST}/books",
+            json=[{"token_id": token_id} for token_id in unique_ids],
+            timeout=(5, 12),
+        )
+        response.raise_for_status()
+        return {str(book.get("asset_id")): book for book in response.json()}
+    except Exception as e:
+        print(f"  [CLOB] Order books unavailable: {e}")
+        return {}
+
+def get_order_book(token_id):
+    if not token_id:
         return None
+    try:
+        response = requests.get(
+            f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=(3, 8)
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"  [CLOB] {token_id}: {e}")
+        return None
+
+def get_yes_token_for_market(market_id):
+    """Backfill token IDs for positions saved before CLOB support was added."""
+    try:
+        response = requests.get(
+            f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 8)
+        )
+        response.raise_for_status()
+        return yes_token_id(response.json())
+    except Exception as e:
+        print(f"  [TOKEN] {market_id}: {e}")
+        return None
+
+def book_quote(book):
+    """Return the executable top-of-book quote for a YES token."""
+    if not book:
+        return None
+    try:
+        bids = [(float(x["price"]), float(x["size"])) for x in book.get("bids", [])]
+        asks = [(float(x["price"]), float(x["size"])) for x in book.get("asks", [])]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not bids or not asks:
+        return None
+    bid, bid_size = max(bids, key=lambda x: x[0])
+    ask, ask_size = min(asks, key=lambda x: x[0])
+    return {
+        "bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
+        "spread": ask - bid, "mid": (ask + bid) / 2,
+    }
+
+def estimate_book_fill(book, side, amount):
+    """Estimate a full taker fill. BUY amount is dollars; SELL amount is shares."""
+    if not book or amount <= 0:
+        return None
+    levels = book.get("asks" if side == "buy" else "bids", [])
+    try:
+        parsed = [(float(x["price"]), float(x["size"])) for x in levels]
+    except (KeyError, TypeError, ValueError):
+        return None
+    parsed.sort(key=lambda x: x[0], reverse=(side == "sell"))
+
+    remaining = float(amount)
+    total_cost = 0.0
+    total_shares = 0.0
+    for price, available_shares in parsed:
+        if price <= 0 or available_shares <= 0:
+            continue
+        shares = min(available_shares, remaining / price) if side == "buy" else min(available_shares, remaining)
+        total_cost += shares * price
+        total_shares += shares
+        remaining -= shares * price if side == "buy" else shares
+        if remaining <= 1e-8:
+            break
+    if remaining > 1e-6 or total_shares <= 0:
+        return None
+    return {
+        "price": total_cost / total_shares,
+        "shares": total_shares,
+        "cost": total_cost,
+    }
 
 def parse_temp_range(question):
     if not question: return None
@@ -432,6 +620,26 @@ def load_all_markets():
         except Exception:
             pass
     return markets
+
+def trade_stats(markets):
+    """Calculate results from closed positions instead of fallible state counters."""
+    completed = []
+    for market in markets:
+        position = market.get("position") or {}
+        pnl = position.get("pnl")
+        if position.get("status") == "closed" and isinstance(pnl, (int, float)):
+            completed.append(market)
+
+    wins = sum(1 for m in completed if m["position"]["pnl"] > 0)
+    losses = sum(1 for m in completed if m["position"]["pnl"] < 0)
+    return {
+        "completed": len(completed),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": len(completed) - wins - losses,
+        "fees": sum(float(m["position"].get("total_fees", 0.0)) for m in completed),
+        "markets": completed,
+    }
 
 def new_market(city_slug, date_str, event, hours):
     loc = LOCATIONS[city_slug]
@@ -552,28 +760,31 @@ def scan_and_update():
 
             # Update outcomes list — prices taken directly from event
             outcomes = []
-            for market in event.get("markets", []):
+            event_markets = event.get("markets", [])
+            books = get_order_books([yes_token_id(market) for market in event_markets])
+            for market in event_markets:
                 question = market.get("question", "")
                 mid      = str(market.get("id", ""))
+                token_id = yes_token_id(market)
                 volume   = float(market.get("volume", 0))
                 rng      = parse_temp_range(question)
-                if not rng:
-                    continue
-                try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
-                except Exception:
+                book     = books.get(token_id)
+                quote    = book_quote(book)
+                if not rng or not token_id or not quote:
                     continue
                 outcomes.append({
                     "question":  question,
                     "market_id": mid,
+                    "token_id":  token_id,
                     "range":     rng,
-                    "bid":       round(bid, 4),
-                    "ask":       round(ask, 4),
-                    "price":     round(bid, 4),   # for compatibility
-                    "spread":    round(ask - bid, 4),
+                    "bid":       round(quote["bid"], 4),
+                    "ask":       round(quote["ask"], 4),
+                    "bid_size":  round(quote["bid_size"], 2),
+                    "ask_size":  round(quote["ask_size"], 2),
+                    "price":     round(quote["mid"], 4),
+                    "spread":    round(quote["spread"], 4),
                     "volume":    round(volume, 0),
+                    "book":      book,
                 })
 
             outcomes.sort(key=lambda x: x["range"][0])
@@ -611,11 +822,10 @@ def scan_and_update():
                 current_price = None
                 for o in outcomes:
                     if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
+                        current_price = o["bid"]
                         break
 
                 if current_price is not None:
-                    current_price = o.get("bid", current_price)  # sell at bid
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
 
@@ -626,11 +836,17 @@ def scan_and_update():
 
                     # Check stop
                     if current_price <= stop:
-                        pnl = round((current_price - entry) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
+                        fill = estimate_book_fill(o.get("book"), "sell", pos["shares"])
+                        if not fill:
+                            continue
+                        current_price = fill["price"]
+                        net_proceeds, exit_fee, pnl = exit_financials(pos, current_price)
+                        balance += net_proceeds
                         pos["closed_at"]    = snap.get("ts")
                         pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
                         pos["exit_price"]   = current_price
+                        pos["exit_fee"]     = exit_fee
+                        pos["total_fees"]   = round(pos.get("entry_fee", 0.0) + exit_fee, 5)
                         pos["pnl"]          = pnl
                         pos["status"]       = "closed"
                         closed += 1
@@ -663,14 +879,17 @@ def scan_and_update():
                     current_price = None
                     for o in outcomes:
                         if o["market_id"] == pos["market_id"]:
-                            current_price = o["price"]
+                            fill = estimate_book_fill(o.get("book"), "sell", pos["shares"])
+                            current_price = fill["price"] if fill else None
                             break
                     if current_price is not None:
-                        pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
+                        net_proceeds, exit_fee, pnl = exit_financials(pos, current_price)
+                        balance += net_proceeds
                         mkt["position"]["closed_at"]    = snap.get("ts")
                         mkt["position"]["close_reason"] = "forecast_changed"
                         mkt["position"]["exit_price"]   = current_price
+                        mkt["position"]["exit_fee"]     = exit_fee
+                        mkt["position"]["total_fees"]   = round(pos.get("entry_fee", 0.0) + exit_fee, 5)
                         mkt["position"]["pnl"]          = pnl
                         mkt["position"]["status"]       = "closed"
                         closed += 1
@@ -691,7 +910,7 @@ def scan_and_update():
 
             # --- OPEN POSITION ---
             if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
-                sigma = get_sigma(city_slug, best_source or "ecmwf")
+                sigma = get_sigma(city_slug, best_source or "ecmwf", hours)
                 best_signal = None
 
                 # Find exactly ONE bucket that matches the forecast
@@ -721,6 +940,7 @@ def scan_and_update():
                             if size >= 0.50:
                                 best_signal = {
                                     "market_id":    o["market_id"],
+                                    "token_id":     o["token_id"],
                                     "question":     o["question"],
                                     "bucket_low":   t_low,
                                     "bucket_high":  t_high,
@@ -744,29 +964,35 @@ def scan_and_update():
                                 }
 
                 if best_signal:
-                    # Fetch real bestAsk from Polymarket API for accurate entry price
                     skip_position = False
-                    try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
-                        mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
+                    fill = estimate_book_fill(matched_bucket.get("book"), "buy", best_signal["cost"])
+                    if not fill:
+                        print(f"  [SKIP] {loc['name']} {date} — insufficient CLOB ask depth")
+                        skip_position = True
+                    else:
+                        real_ask = fill["price"]
+                        real_bid = matched_bucket["bid"]
                         real_spread = round(real_ask - real_bid, 4)
-                        # Re-check slippage and price with real values
-                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
-                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
+                        real_ev = calc_ev(best_signal["p"], real_ask)
+                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE or real_ev < MIN_EV:
+                            print(f"  [SKIP] {loc['name']} {date} — fill ${real_ask:.3f} spread ${real_spread:.3f}")
                             skip_position = True
                         else:
-                            best_signal["entry_price"]  = real_ask
+                            best_signal["entry_price"] = real_ask
                             best_signal["bid_at_entry"] = real_bid
-                            best_signal["spread"]       = real_spread
-                            best_signal["shares"]       = round(best_signal["cost"] / real_ask, 2)
-                            best_signal["ev"]           = round(calc_ev(best_signal["p"], real_ask), 4)
-                    except Exception as e:
-                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                            best_signal["spread"] = real_spread
+                            best_signal["shares"] = round(fill["shares"], 4)
+                            best_signal["cost"] = round(fill["cost"], 2)
+                            best_signal["fee_rate"] = TAKER_FEE_RATE
+                            best_signal["entry_fee"] = estimate_taker_fee(
+                                best_signal["shares"], real_ask, TAKER_FEE_RATE
+                            )
+                            best_signal["total_fees"] = best_signal["entry_fee"]
+                            best_signal["ev"] = round(real_ev, 4)
 
-                    if not skip_position and best_signal["entry_price"] < MAX_PRICE:
-                        balance -= best_signal["cost"]
+                    total_debit = best_signal["cost"] + best_signal.get("entry_fee", 0.0)
+                    if not skip_position and best_signal["entry_price"] < MAX_PRICE and total_debit <= balance:
+                        balance -= total_debit
                         mkt["position"] = best_signal
                         state["total_trades"] += 1
                         new_pos += 1
@@ -781,6 +1007,7 @@ def scan_and_update():
         f"**Bucket:** {bucket_label}\n"
         f"**Entry:** ${best_signal['entry_price']:.3f}\n"
         f"**Cost:** ${best_signal['cost']:.2f}\n"
+        f"**Estimated Entry Fee:** ${best_signal['entry_fee']:.5f}\n"
         f"**Shares:** {best_signal['shares']}\n"
         f"**Forecast:** {best_signal['forecast_temp']}{unit_sym} "
         f"({best_signal['forecast_src'].upper()})\n"
@@ -795,6 +1022,11 @@ def scan_and_update():
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
+            # Keep quotes and liquidity, but do not persist the full depth payload.
+            mkt["all_outcomes"] = [
+                {key: value for key, value in outcome.items() if key != "book"}
+                for outcome in outcomes
+            ]
             save_market(mkt)
             time.sleep(0.1)
 
@@ -822,10 +1054,15 @@ def scan_and_update():
         price  = pos["entry_price"]
         size   = pos["cost"]
         shares = pos["shares"]
-        pnl    = round(shares * (1 - price), 2) if won else round(-size, 2)
+        resolution_price = 1.0 if won else 0.0
+        net_proceeds, exit_fee, pnl = exit_financials(
+            pos, resolution_price, charge_fee=False
+        )
 
-        balance += size + pnl
-        pos["exit_price"]   = 1.0 if won else 0.0
+        balance += net_proceeds
+        pos["exit_price"]   = resolution_price
+        pos["exit_fee"]     = exit_fee
+        pos["total_fees"]   = round(pos.get("entry_fee", 0.0), 5)
         pos["pnl"]          = pnl
         pos["close_reason"] = "resolved"
         pos["closed_at"]    = now.isoformat()
@@ -833,6 +1070,8 @@ def scan_and_update():
         mkt["pnl"]          = pnl
         mkt["status"]       = "resolved"
         mkt["resolved_outcome"] = "win" if won else "loss"
+        if mkt.get("actual_temp") is None and VC_KEY:
+            mkt["actual_temp"] = get_actual_temp(mkt["city"], mkt["date"])
 
         if won:
             state["wins"] += 1
@@ -848,6 +1087,7 @@ def scan_and_update():
         f"**Result:** {result}\n"
         f"**Entry:** ${price:.3f}\n"
         f"**Cost:** ${size:.2f}\n"
+        f"**Fees:** ${pos.get('total_fees', 0.0):.5f}\n"
         f"**Shares:** {shares}\n"
         f"**PnL:** {'+' if pnl >= 0 else ''}${pnl:.2f}"
     ),
@@ -883,18 +1123,23 @@ def print_status():
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
     resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
 
-    bal     = state["balance"]
-    start   = state["starting_balance"]
-    ret_pct = (bal - start) / start * 100
-    wins    = state["wins"]
-    losses  = state["losses"]
-    total   = wins + losses
+    bal     = state.get("balance", BALANCE)
+    start   = state.get("starting_balance", BALANCE)
+    ret_pct = (bal - start) / start * 100 if start else 0.0
+    stats   = trade_stats(markets)
+    wins    = stats["wins"]
+    losses  = stats["losses"]
+    total   = stats["completed"]
+    decided = wins + losses
+    win_rate = wins / decided if decided else 0.0
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STATUS")
     print(f"{'='*55}")
     print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
-    print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
+    print(f"  Completed:   {total} | W: {wins} | L: {losses} | "
+          f"BE: {stats['breakeven']} | WR: {win_rate:.0%}" if total else "  No completed trades yet")
+    print(f"  Fees paid:   ${stats['fees']:.2f}")
     print(f"  Open:        {len(open_pos)}")
     print(f"  Resolved:    {len(resolved)}")
 
@@ -916,7 +1161,7 @@ def print_status():
                         current_price = o["price"]
                         break
 
-            unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
+            _, _, unrealized = exit_financials(pos, current_price)
             total_unrealized += unrealized
             pnl_str = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
 
@@ -942,6 +1187,7 @@ def print_report():
         return
 
     total_pnl = sum(m["pnl"] for m in resolved)
+    total_fees = sum(float((m.get("position") or {}).get("total_fees", 0.0)) for m in resolved)
     wins      = [m for m in resolved if m["resolved_outcome"] == "win"]
     losses    = [m for m in resolved if m["resolved_outcome"] == "loss"]
 
@@ -949,6 +1195,7 @@ def print_report():
     print(f"  Wins:           {len(wins)} | Losses: {len(losses)}")
     print(f"  Win rate:       {len(wins)/len(resolved):.0%}")
     print(f"  Total PnL:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
+    print(f"  Fees paid:      ${total_fees:.2f}")
 
     print(f"\n  By city:")
     for city in sorted(set(m["city"] for m in resolved)):
@@ -994,24 +1241,15 @@ def monitor_positions():
     for mkt in open_pos:
         pos = mkt["position"]
         mid = pos["market_id"]
+        token_id = pos.get("token_id") or get_yes_token_for_market(mid)
+        if token_id and not pos.get("token_id"):
+            pos["token_id"] = token_id
+            save_market(mkt)
 
-        # Fetch real bestBid from Polymarket API — actual sell price
-        current_price = None
-        try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-            mdata = r.json()
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
-        except Exception:
-            pass
-
-        # Fallback to cached price if API failed
-        if current_price is None:
-            for o in mkt.get("all_outcomes", []):
-                if o["market_id"] == mid:
-                    current_price = o.get("bid", o["price"])
-                    break
+        # Value and liquidate against the actual YES-token CLOB bids.
+        book = get_order_book(token_id)
+        quote = book_quote(book)
+        current_price = quote["bid"] if quote else None
 
         if current_price is None:
             continue
@@ -1044,8 +1282,13 @@ def monitor_positions():
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
-            pnl = round((current_price - entry) * pos["shares"], 2)
-            balance += pos["cost"] + pnl
+            fill = estimate_book_fill(book, "sell", pos["shares"])
+            if not fill:
+                print(f"  [SKIP] {city_name} {mkt['date']} — insufficient CLOB bid depth")
+                continue
+            current_price = fill["price"]
+            net_proceeds, exit_fee, pnl = exit_financials(pos, current_price)
+            balance += net_proceeds
             pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
             if take_triggered:
                 pos["close_reason"] = "take_profit"
@@ -1057,6 +1300,8 @@ def monitor_positions():
                 pos["close_reason"] = "trailing_stop"
                 reason = "TRAILING BE"
             pos["exit_price"]   = current_price
+            pos["exit_fee"]     = exit_fee
+            pos["total_fees"]   = round(pos.get("entry_fee", 0.0) + exit_fee, 5)
             pos["pnl"]          = pnl
             pos["status"]       = "closed"
             closed += 1

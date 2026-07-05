@@ -11,5 +11,6 @@
   "calibration_min": 30,
   "vc_key": "RYVXHUCTVYCVZNQJX8LW3CDCJ",
   "max_slippage": 0.03,
+  "taker_fee_rate": 0.05,
   "discord_webhook_url": "WEBHOOK URL"
 }
